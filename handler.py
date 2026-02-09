@@ -6,23 +6,33 @@ import requests
 import numpy as np
 from pydub import AudioSegment
 from nltk.tokenize import sent_tokenize
+from huggingface_hub import snapshot_download
+
+# --- AUTHENTICATION ---
+HF_TOKEN = "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"
+MODEL_PATH = "checkpoints/s1-mini"
+
+# Worker start hote hi download karega (RunPod ki disk space use hogi, Codespaces ki nahi)
+if not os.path.exists(MODEL_PATH):
+    print("--- Downloading Model Weights on RunPod ---")
+    snapshot_download(repo_id='fishaudio/openaudio-s1-mini', local_dir=MODEL_PATH, token=HF_TOKEN)
+
 from fish_speech.utils.inference import load_checkpoint, generate_tokens, decode_audio
 
-# Setup: Model weights pehle se image mein baked hain 
+# Setup
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print("--- Loading Baked Fish-Speech Model ---")
-model_manager = load_checkpoint("checkpoints/s1-mini", device)
+model_manager = load_checkpoint(MODEL_PATH, device)
 
 def handler(job):
     ins = job['input']
     text = ins.get("text", "")
-    ref_audio_url = ins.get("ref_audio_url") # Clone karne ke liye voice link
+    ref_audio_url = ins.get("ref_audio_url")
 
     if not text or not ref_audio_url:
         return {"error": "Missing input: 'text' or 'ref_audio_url'"}
 
     try:
-        # 1. Reference Audio Download aur Refinement
+        # 1. Reference Audio Download
         ref_path = "temp_ref.wav"
         with open(ref_path, "wb") as f:
             f.write(requests.get(ref_audio_url).content)
@@ -30,20 +40,16 @@ def handler(job):
         ref_audio = AudioSegment.from_file(ref_path).set_frame_rate(44100).set_channels(1)
         ref_audio.export("refined_ref.wav", format="wav")
 
-        # 2. 100k Characters Chunking (XTTS Logic) 
+        # 2. 100k Chars Chunking
         sentences = sent_tokenize(text)
         segments = []
-        
         for i, s in enumerate(sentences):
-            # Voice tokens generation
             tokens = generate_tokens(model=model_manager.llama, text=s, device=device)
             wav = decode_audio(model_manager.dac, tokens)
             segments.append(wav)
-            
-            # Memory safety: Har 10 sentences baad cache saaf karein
             if i % 10 == 0: torch.cuda.empty_cache()
 
-        # 3. Final Audio Stitching aur Export
+        # 3. Stitch & Upload
         final_wav = np.concatenate(segments)
         int_audio = (final_wav * 32767).astype(np.int16)
         combined_audio = AudioSegment(int_audio.tobytes(), frame_rate=44100, sample_width=2, channels=1)
@@ -51,7 +57,6 @@ def handler(job):
         out_file = f"{job['id']}.mp3"
         combined_audio.export(out_file, format="mp3", bitrate="192k")
         
-        # 4. S3 Upload (XTTS Structure) 
         s3 = boto3.client('s3', 
             aws_access_key_id=os.getenv('S3_KEY'), 
             aws_secret_access_key=os.getenv('S3_SECRET')
